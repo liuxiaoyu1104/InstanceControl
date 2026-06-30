@@ -1,0 +1,59 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        
+        {
+            "name": "diffusion_rig",
+            "type": "python",
+            "request": "launch",
+            "cwd": "/hdd3/liuxiaoyu/a_train_controlnet_4_lora__only_flxu/",
+            "program": "/hdd3/liuxiaoyu/a_train_controlnet_4_lora__only_flxu/test_1.py",
+            "args": [
+               
+             
+                     ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "attention",
+            "type": "python",
+            "request": "launch",
+            "cwd": "/hdd1/liuxiaoyu/a_train_controlnet_4_lora__only_flxu/",
+            "program": "/hdd1/liuxiaoyu/a_train_controlnet_4_lora__only_flxu/test_predict.py",
+            "args": [
+               
+              
+                     ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+
+
+        {
+            "name": "elite",
+            "type": "python",
+            "request": "launch",
+            "cwd": "/home/ubuntuu/hdd/liuxiaoyu/ELITE-main",
+            "program": "/home/ubuntuu/hdd/liuxiaoyu/ELITE-main/inference_local.py",
+            "args": [
+                    "--pretrained_model_name_or_path=CompVis/stable-diffusion-v1-4",
+                    "--test_data_dir=./test_datasets/",
+                     "--output_dir=./outputs/local_mapping",
+                     "--suffix=object",
+                     "--template=a photo of a S",
+                     "--llambda=0.8",
+                     "--global_mapper_path=./checkpoints/global_mapper.pt",
+                     "--local_mapper_path=./checkpoints/local_mapper.pt",
+                     "--seed=42"
+                    ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+        
+    ]
+}

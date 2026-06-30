@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="150" viewBox="0 0 980 150" role="img" aria-label="InstanceControl">
+  <defs>
+    <linearGradient id="titleGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#46cbc7"/>
+      <stop offset="50%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#de5a1d"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="22%" cy="52%" r="60%">
+      <stop offset="0%" stop-color="#46cbc7" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#46cbc7" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowOrange" cx="78%" cy="48%" r="60%">
+      <stop offset="0%" stop-color="#de5a1d" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#de5a1d" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softShadow" x="-10%" y="-30%" width="120%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#020617" flood-opacity="0.55"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#46cbc7" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="980" height="150" rx="28" fill="#050a14"/>
+  <rect width="980" height="150" rx="28" fill="url(#glowCyan)"/>
+  <rect width="980" height="150" rx="28" fill="url(#glowOrange)"/>
+  <path d="M40 118 C190 58, 300 126, 460 78 S725 32, 940 92" fill="none" stroke="#a855f7" stroke-opacity="0.22" stroke-width="2"/>
+  <text x="490" y="94"
+        text-anchor="middle"
+        font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+        font-size="70"
+        font-weight="800"
+        letter-spacing="1.2"
+        fill="url(#titleGradient)"
+        filter="url(#softShadow)">InstanceControl</text>
+</svg>

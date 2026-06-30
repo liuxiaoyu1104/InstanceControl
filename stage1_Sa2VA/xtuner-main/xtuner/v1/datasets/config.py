@@ -1,0 +1,119 @@
+from pathlib import Path
+from typing import Annotated, Literal, Optional, Protocol, runtime_checkable
+
+from cyclopts import Parameter
+from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from typing_extensions import TypedDict
+
+from .collator import (
+    fake_collator,
+    intern_s1_vl_sft_collator,
+    qwen3_vl_sft_collator,
+    sft_llm_collator,
+)
+from .jsonl import JsonlDataset
+from .utils import CachableTokenizeFunction
+from .vlm_jsonl import VLMJsonlDataset
+
+
+# TODO: Enhance the configurable fields of dataset config
+class DatasetConfig(BaseModel):
+    model_config = ConfigDict(title="Base dataset config for xtuner", extra="allow")
+    anno_path: Annotated[str | Path, Parameter(group="dataset")]
+    cache_dir: str | Path | None = None
+    cache_tag: str | None = None
+    name: Annotated[str, Parameter(group="dataset")] = "default"
+    class_name: Annotated[str, Parameter(group="dataset")] = "JsonlDataset"
+    sample_ratio: Annotated[float, Parameter(group="dataset")] = 1.0
+    media_root: Annotated[str, Parameter(group="dataset")] = ""
+
+    def build(
+        self,
+        tokenize_fn: Optional["CachableTokenizeFunction"] = None,
+    ) -> "JsonlDataset":
+        if self.class_name == "JsonlDataset":
+            return JsonlDataset(
+                tokenize_fn=tokenize_fn,
+                anno_path=self.anno_path,
+                sample_ratio=self.sample_ratio,
+                name=self.name,
+                cache_dir=self.cache_dir,
+                cache_tag=self.cache_tag,
+            )
+        elif self.class_name == "VLMJsonlDataset":
+            return VLMJsonlDataset(
+                tokenize_fn=tokenize_fn,
+                anno_path=self.anno_path,
+                sample_ratio=self.sample_ratio,
+                name=self.name,
+                media_root=self.media_root,
+                cache_dir=self.cache_dir,
+                cache_tag=self.cache_tag,
+            )
+        else:
+            raise ValueError(f"Unsupported class_name: {self.class_name}")
+
+
+@runtime_checkable
+class BaseTokenizeFnConfig(Protocol):
+    def build(
+        self, tokenizer, tokenizer_hash: str | None = None, anno_name: str | None = None, **kwargs
+    ) -> "CachableTokenizeFunction":
+        """Build the tokenize function."""
+        raise NotImplementedError
+
+
+class DataloaderConfig(BaseModel):
+    model_config = ConfigDict(title="Base dataloader config for xtuner", extra="allow")
+    collator: Annotated[
+        Literal["sft_llm_collator", "intern_s1_vl_sft_collator", "qwen3_vl_sft_collator", "fake_collator"],
+        Parameter(help="collator func name"),
+    ] = "sft_llm_collator"
+    pack_level: Annotated[
+        Literal["soft", "none", "__legacy", "hard"], Parameter(help="__legacy is only for debug")
+    ] = "soft"
+    pack_max_length: Annotated[int, Parameter(help="pack max length")] = 32768
+    pack_chunk_size: Annotated[int, Parameter(help="pack chunk size")] = 10000
+    pack_workers: Annotated[int, Parameter(help="pack workers")] = 8
+    global_pack: Annotated[bool, Parameter(help="enable or disable global pack mode")] = True
+    group_by_length: Annotated[bool, Parameter(help="enable or disable group by length mode")] = True
+    pack_extra_buffer_size: Annotated[
+        int, Parameter(help="pack extra buffer size when pack_level is expand_soft model")
+    ] = 100
+    num_workers: Annotated[int, Parameter(help="dataloader num workers")] = 0
+    pad_token_id: Annotated[int | None, Parameter(help="padding token id")] = None
+
+    def build_collator(self):
+        if self.collator == "sft_llm_collator":
+            return sft_llm_collator
+        elif self.collator == "intern_s1_vl_sft_collator":
+            return intern_s1_vl_sft_collator
+        elif self.collator == "qwen3_vl_sft_collator":
+            return qwen3_vl_sft_collator
+        elif self.collator == "fake_collator":
+            return fake_collator  # for RL
+        else:
+            raise ValueError(f"Unsupported collator: {self.collator}")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_group_by_length(cls, data) -> None:
+        if "pack_level" in data and "group_by_length" not in data:
+            if data["pack_level"] == "none":
+                data["group_by_length"] = False
+            else:
+                data["group_by_length"] = True
+
+        if "group_by_length" in data and "pack_level" in data:
+            if data["pack_level"] == "none" and data["group_by_length"] is True:
+                raise ValueError("group_by_length must be False when pack_level is none.")
+        return data
+
+
+class DatasetCombine(TypedDict):
+    dataset: DatasetConfig
+    tokenize_fn: BaseTokenizeFnConfig
+
+
+DatasetConfigList = list[DatasetCombine]
+DatasetConfigListAdatper = TypeAdapter(DatasetConfigList, config=ConfigDict(arbitrary_types_allowed=True))

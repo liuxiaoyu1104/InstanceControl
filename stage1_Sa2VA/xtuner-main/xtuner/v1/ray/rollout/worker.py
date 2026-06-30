@@ -1,0 +1,552 @@
+import copy
+import json
+import multiprocessing
+import time
+import uuid
+from abc import abstractmethod
+from typing import Any, Callable, Dict, List, Optional, Union
+
+import httpx
+import ray
+import requests  # type: ignore[import-untyped]
+from cyclopts import Parameter
+from pydantic import BaseModel, Field
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from typing_extensions import Annotated
+
+from xtuner.v1.ray import find_master_addr_and_port
+from xtuner.v1.ray.accelerator import AutoAcceleratorWorkers, SingleAcceleratorWorker
+from xtuner.v1.ray.config import RolloutConfig
+from xtuner.v1.utils import get_logger
+
+
+class SampleParams(BaseModel):
+    """Sampling parameters configuration for text generation in XTuner.
+
+    Args:
+        n (int): Number of samples to generate for each input. Defaults to 1.
+        top_k (int): Number of highest probability vocabulary tokens to keep for
+            top-k filtering. Set to 0 to disable. Defaults to 0.
+        top_p (float): Cumulative probability threshold for nucleus (top-p) sampling.
+            Defaults to 1.0.
+        temperature (float): Sampling temperature to control randomness. Lower values
+            make output more deterministic. Defaults to 1.0.
+        repetition_penalty (float): Penalty applied to tokens that have already
+            appeared in the sequence. Defaults to 1.0 (no penalty).
+        presence_penalty (float): Penalty applied based on token presence in the
+            generated text. Defaults to 0.0.
+        frequency_penalty (float): Penalty applied based on token frequency in the
+            generated text. Defaults to 0.0.
+        min_tokens (int): Minimum number of tokens to generate before considering
+            stop conditions. Defaults to 0.
+        max_tokens (int): Maximum number of tokens to generate. Defaults to 2048.
+        stops (List[str]): List of string sequences that will stop generation when
+            encountered. Defaults to empty list.
+        stop_token_ids (List[int]): List of token IDs that will stop generation when
+            encountered. Defaults to empty list.
+        logprobs (int): Number of log probabilities to return for each token.
+            Set to 0 to disable. Defaults to 0.
+        skip_special_tokens (bool): Whether to skip special tokens during decoding.
+            Defaults to True.
+        do_sample (bool): Whether to use sampling (True) or greedy decoding (False).
+            Defaults to True.
+    """
+
+    n: Annotated[int, Parameter(help="Number of samples to generate.")] = 1
+    top_k: Annotated[
+        int, Parameter(help="The number of highest probability vocabulary tokens to keep for top-k-filtering.")
+    ] = 0
+    top_p: Annotated[float, Parameter(help="The cumulative probability for nucleus sampling.")] = 1.0
+    temperature: Annotated[float, Parameter(help="The value used to module the next token probabilities.")] = 1.0
+    repetition_penalty: Annotated[float, Parameter(help="The parameter for repetition penalty.")] = 1.0
+    presence_penalty: Annotated[float, Parameter(help="The parameter for presence penalty.")] = 0.0
+    frequency_penalty: Annotated[float, Parameter(help="The parameter for frequency penalty.")] = 0.0
+    min_tokens: Annotated[int, Parameter(help="Minimum number of tokens to generate.")] = 0
+    max_tokens: Annotated[int, Parameter(help="Maximum number of tokens to generate.")] = 2048
+    stops: Annotated[List[str], Parameter(help="List of stop sequences.")] = []
+    stop_token_ids: Annotated[List[int], Parameter(help="List of stop token IDs.")] = []
+    logprobs: Annotated[int, Parameter(help="Number of log probabilities to return.")] = 0
+    skip_special_tokens: Annotated[bool, Parameter(help="Whether to skip special tokens.")] = True
+    do_sample: Annotated[bool, Parameter(help="Whether to sample or not.")] = True
+
+
+class RolloutRequest(BaseModel):
+    messages: Union[str, List[Dict[str, Any]]]
+    tools: List = Field(default_factory=list)
+    tool_choice: str = "auto"
+    sample_params: SampleParams = Field(default_factory=SampleParams)
+    extra_params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RolloutResponse(BaseModel):
+    response: str = ""
+    logprobs: float = 0.0
+    finish_reason: str = ""
+    reasoning_content: str = ""
+    usage: dict = Field(default_factory=dict)
+    tool_calls: List[str] = Field(default_factory=list)
+
+
+class RolloutWorker(SingleAcceleratorWorker):
+    """Base class for a rollout worker that runs an inference server.
+
+    This class manages the lifecycle of a distributed inference server, including initialization, launching, and
+    handling generation requests. It is designed to be subclassed for specific inference backends like LMDeploy, vLLM
+    or SGLang.
+    """
+
+    def __init__(
+        self,
+        config: RolloutConfig,
+        rank: int,
+        master_addr: str,
+        master_port: int,
+        world_size: int,
+        accelerator: str = "GPU",
+    ):
+        """Initialize the RolloutWorker.
+
+        Args:
+            config (RolloutConfig): The configuration for the rollout.
+            rank (int): The rank of this worker in the distributed setup.
+            master_addr (str): The address of the Ray master node.
+            master_port (int): The port of the Ray master node.
+            world_size (int): The total number of workers.
+            accelerator (str): The type of accelerator to use.
+                Defaults to "GPU".
+        """
+        self.config = config
+        self.rank = rank
+        self.master_addr = master_addr  # ray master
+        self.master_port = master_port
+        self.world_size = world_size
+        self.accelerator = accelerator
+        self.server_func: Callable
+        self.endpoints: dict[str, str] = dict()
+        # handle stream response
+        self.client = httpx.AsyncClient(timeout=self.config.rollout_timeout)
+        self.paused = False
+        self.server_task = None
+        self.engine_bundle_idxs: list[int] = []
+        self.server_process: Optional[multiprocessing.Process] = None
+        self.logger = get_logger()
+
+    def init_dist_port(self):
+        """Initialize distributed communication ports.
+
+        This method acquires three free ports for the distributed setup:
+        one for the inference server, one for NCCL, and one for Ray's
+        distributed communication.
+
+        Returns:
+            str: The distributed initialization address (host:port).
+        """
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=ray.util.get_current_placement_group(),
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=self.engine_bundle_idxs[0],
+        )
+        self.host, self.ports = ray.get(
+            find_master_addr_and_port.options(scheduling_strategy=scheduling_strategy).remote(3)
+        )
+        self.dist_port = self.ports[0]
+        self.server_port = self.ports[1]
+        self.nccl_port = self.ports[2]
+        self.dist_init_addr = f"{self.host}:{self.dist_port}"
+        self.server_url = f"http://{self.host}:{self.server_port}"
+        return self.dist_init_addr
+
+    def init(self, dist_init_addr: str = ""):
+        """Initialize the worker and launch the server.
+
+        Args:
+            dist_init_addr (str): The distributed initialization address.
+                If not provided, the one generated by `init_dist_port` is used.
+
+        Returns:
+            Tuple[int, str]: A tuple containing the worker's rank and its
+                server URL.
+        """
+        self.dist_init_addr = dist_init_addr if dist_init_addr else self.dist_init_addr
+        self.launch_server()
+        return (self.rank, self.server_url)
+
+    def set_engine_bundle_idxs(self, engine_bundle_idxs: list[int]):
+        """Set the bundle indices for the inference engine.
+
+        This is used by some backends (like LMDeploy with Ray executor) to
+        know which bundles in the placement group belong to this engine.
+
+        Args:
+            engine_bundle_idxs (list[int]): A list of bundle indices.
+        """
+        self.engine_bundle_idxs = engine_bundle_idxs
+
+    def launch_server(self):
+        """Launch the inference server as a separate process or Ray task.
+
+        It waits for the server to become healthy before returning.
+
+        Raises:
+            TimeoutError: If the server fails to start within the specified
+                timeout.
+            Exception: If the server task terminates unexpectedly.
+        """
+        server_configs = self._transform_rollout_config_to_server_configs()
+        timeout = 3600.0  # Increased timeout to 5 minutes for downloading large models
+        start_time = time.perf_counter()
+        last_log_time = start_time
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {server_configs.api_key}",
+        }
+
+        self.logger.info(f"launch server task on server_url: {self.server_url}")
+
+        # note(@duanyanhui): launch server as multiprocessing for sglang temporarily
+        if self.config.launch_server_method == "multiprocessing":
+            process = multiprocessing.Process(target=self.server_func, args=(server_configs,))
+            process.start()
+            self.server_process = process
+            time.sleep(60)  # Wait for the server to start
+            with requests.Session() as session:
+                while time.perf_counter() - start_time < timeout:
+                    try:
+                        response = session.get(
+                            f"{self.server_url}/{self.endpoints['health_generate']}", headers=headers
+                        )
+                        if response.status_code == 200:
+                            return
+                    except requests.RequestException as e:
+                        self.logger.error(
+                            f"can't connect to server url {self.server_url}/{self.endpoints['health_generate']} because {e}"
+                        )
+
+                    current_time = time.perf_counter()
+                    if current_time - last_log_time >= 15:
+                        self.logger.info(
+                            f"Still waiting for server to start... Elapsed time: {current_time - start_time:.2f}s"
+                        )
+                        last_log_time = current_time
+
+                    time.sleep(5)
+            process.terminate()
+            raise TimeoutError("Server failed to start within the timeout period.")
+        else:
+            # launch the server as ray task
+            # so that the lmdeploy backend could get externl pg
+            current_pg = ray.util.get_current_placement_group()
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=current_pg,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=self.engine_bundle_idxs[0],
+            )
+            assert ray.is_initialized()
+            ray_kwargs = (
+                {"runtime_env": server_configs.ray_runtime_env} if hasattr(server_configs, "ray_runtime_env") else {}
+            )
+            self.server_task = (
+                ray.remote(self.server_func)
+                .options(
+                    scheduling_strategy=scheduling_strategy,
+                    **AutoAcceleratorWorkers.get_pg_options(current_pg),
+                    **ray_kwargs,
+                )
+                .remote(server_configs)
+            )
+
+            with requests.Session() as session:
+                while time.perf_counter() - start_time < timeout:
+                    try:
+                        response = session.get(
+                            f"{self.server_url}/{self.endpoints['health_generate']}", headers=headers
+                        )
+                        if response.status_code == 200:
+                            return
+                    except requests.RequestException:
+                        pass
+
+                    try:
+                        ray.get(self.server_task, timeout=0.1)
+                        raise Exception("Server task terminated unexpectedly.")
+                    except ray.exceptions.GetTimeoutError:
+                        pass
+                    except Exception as e:
+                        raise e
+
+                    current_time = time.perf_counter()
+                    if current_time - last_log_time >= 15:
+                        self.logger.info(
+                            f"Still waiting for server to start... Elapsed time: {current_time - start_time:.2f}s"
+                        )
+                        last_log_time = current_time
+
+            ray.cancel(self.server_task)
+            raise TimeoutError("Server failed to start within the timeout period.")
+
+    def _adapt_input_to_openai_spec(self, prompts, tools, tool_choice):
+        openai_prompts = []
+        openai_tools = []
+        # transform claude spec to openai spec
+        # 1. transform system prompt: concat provided system_prompt to input prompt
+        system_prompt = self.config.system_prompt
+        if system_prompt:
+            system_prompt_json = {"role": "system", "content": f"{system_prompt}"}
+            prompts.insert(0, system_prompt_json)
+        # 2. transform multi-modal usage
+        for prompt in prompts:
+            content = prompt["content"]
+            openai_content = []
+            for item in content:
+                if item["type"] == "image":
+                    if item["source"]["type"] == "base64":
+                        openai_url = f"data:{item['source']['media_type']};base64,{item['source']['data']}"
+                    if item["source"]["type"] == "url":
+                        openai_url = item["source"]["url"]
+                    new_prompt = {"type": "image_url", "image_url": {"url": openai_url}}
+                    openai_content.append(new_prompt)
+                elif item["type"] == "text":
+                    openai_content.append(item)
+            new_prompt = copy.deepcopy(prompt)
+            new_prompt["content"] = openai_content
+            openai_prompts.append(new_prompt)
+        # 3. transform tool use
+        for tool in tools:
+            openai_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                },
+            }
+            openai_tools.append(openai_tool)
+        return openai_prompts, openai_tools
+
+    async def rollout_task(
+        self,
+        prompts: Union[str, List[Dict[str, Any]]],
+        tools: List,
+        tool_choice: str,
+        sample_params: dict,
+        extra_params: dict,
+        format: str,
+    ) -> RolloutResponse:
+        uid = str(uuid.uuid4())
+        response = None
+        try:
+            if format == "openai":
+                openai_prompts, openai_tools = prompts, tools
+            else:
+                openai_prompts, openai_tools = self._adapt_input_to_openai_spec(prompts, tools, tool_choice)
+            response = await self._create_request(
+                f"{self.server_url}/{self.endpoints['generate']}",
+                openai_prompts,
+                openai_tools,
+                tool_choice,
+                sample_params=sample_params,
+                extra_params=extra_params,
+            )
+            self.logger.debug(f" +++ send request {uid} to worker: {self.rank}")
+
+            failed_rollout_response = RolloutResponse(
+                response="",
+                finish_reason="failed",
+            )
+            if response.status_code != 200:
+                error_body = await response.atext()
+                self.logger.error(f"Request {uid} failed with status {response.status_code}: {error_body}")
+                return failed_rollout_response
+
+            last_trajectory = ""
+            finish_reason = ""
+
+            async for chunk in response.aiter_lines():
+                # chunk example
+                # data: {"id":"1","object":"chat.completion.chunk","created":1757495636,"model":"qwen3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":"<think>","reasoning_content":null,"tool_calls":[]},"logprobs":null,"finish_reason":null}],"usage":null}
+                if not chunk.startswith("data:"):
+                    continue
+                try:
+                    chunk_data_str = chunk[len("data:") :].strip()
+                    if self.paused or chunk_data_str == "[DONE]":
+                        finish_reason = "paused" if self.paused else finish_reason
+                        break
+                    if not (chunk_data_str.startswith("{") and chunk_data_str.endswith("}")):
+                        continue
+
+                    chunk_data = json.loads(chunk_data_str)
+                    delta_content = chunk_data["choices"][0]["delta"].get("content")
+                    last_trajectory = last_trajectory + delta_content if delta_content else last_trajectory
+                    finish_reason = chunk_data["choices"][0].get("finish_reason")
+
+                    # todo(@duanyanhui): remove appending stop tokens manually after lmdeploy support return stop_token_ids.
+                    if finish_reason == "stop":
+                        assert len(sample_params["stops"]) == 1
+                        last_trajectory += sample_params["stops"][0]
+
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"JSON decode error for chunk in request {uid}: {chunk}, error: {e}")
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error processing chunk for {uid}: {chunk}, error: {e}")
+                    return failed_rollout_response
+
+            assert finish_reason in ["stop", "length", "tool_call", "paused", "failed"], (
+                f"Unexpected finish_reason: {finish_reason}"
+            )
+
+            rollout_response = RolloutResponse(
+                response=last_trajectory,
+                finish_reason=finish_reason,
+            )
+            return rollout_response
+
+        except httpx.RequestError as e:
+            self.logger.error(f"Request {uid} failed with a network error: {e}")
+            return failed_rollout_response
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred in rollout_task for {uid}: {e}")
+            return failed_rollout_response
+        finally:
+            # Always try to close the response.
+            if response:
+                await response.aclose()
+
+    async def rollout(
+        self,
+        prompt: Union[str, List[Dict[str, Any]]],
+        tools: List = [],
+        tool_choice: str = "auto",
+        sample_params: dict = dict(),
+        extra_params: dict = dict(),
+        format: str = "openai",
+    ) -> RolloutResponse:
+        """Public method to initiate a rollout.
+
+        Args:
+            prompt (str): The input prompt for generation.
+            sample_params (dict): Parameters for sampling.
+
+        Returns:
+            The result of the `rollout_task`.
+        """
+        return await self.rollout_task(prompt, tools, tool_choice, sample_params, extra_params, format=format)
+
+    def pause(self):
+        """Pause the worker's generation process."""
+        self.paused = True
+        self.pause_generation()
+
+    def restart(self):
+        """Resume the worker's generation process."""
+        self.paused = False
+        self.continue_generation()
+
+    def shutdown(self):
+        """Shut down the worker, its server task, and any child processes."""
+        if self.server_task is not None:
+            ray.cancel(self.server_task)
+            return
+
+        if self.server_process is not None:
+            import psutil
+
+            parent = psutil.Process(self.server_process.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                child.terminate()
+            gone, alive = psutil.wait_procs(children, timeout=5)
+            for child in alive:
+                child.kill()
+            parent.terminate()
+            parent.wait(timeout=5)
+            self.logger.debug(f"Worker {self.rank} server process and its children terminated.")
+            return
+
+    @abstractmethod
+    async def _create_request(
+        self,
+        url: str,
+        prompt: Union[str, List[Dict[str, Any]]],
+        tools: List,
+        tool_choice: str,
+        sample_params: dict,
+        extra_params: dict,
+    ):
+        """Abstract method to create a generation request.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("_create_request must be implemented in subclass")
+
+    @abstractmethod
+    def _transform_rollout_config_to_server_configs(self):
+        """Abstract method to transform rollout config to server configs.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("_transform_rollout_config_to_server_configs must be implemented in subclass")
+
+    @abstractmethod
+    def get_logprobs(self, input_ids, sampling_params):
+        """Abstract method to get log probabilities.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("get_logprobs must be implemented in subclass")
+
+    @abstractmethod
+    def update_weights(self):
+        """Abstract method to update model weights.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("update_weights must be implemented in subclass")
+
+    @abstractmethod
+    def reset_prefix_cache(self):
+        """Abstract method to reset the prefix cache.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("reset_prefix_cache must be implemented in subclass")
+
+    @abstractmethod
+    def offload(self):
+        """Abstract method to offload the model and KVcache.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("reset_prefix_cache must be implemented in subclass")
+
+    @abstractmethod
+    def onload_weights(self):
+        """Abstract method to onload the model weights.
+
+        Must be implemented by subclasses.
+        """
+        pass
+
+    @abstractmethod
+    def onload_kvcache(self):
+        """Abstract method to onload the KV cache.
+
+        Must be implemented by subclasses.
+        """
+        pass
+
+    @abstractmethod
+    def pause_generation(self):
+        """Abstract method to pause the generation process.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("pause_generation must be implemented in subclass")
+
+    @abstractmethod
+    def continue_generation(self):
+        """Abstract method to continue the generation process.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("continue_generation must be implemented in subclass")
