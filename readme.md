@@ -1,9 +1,7 @@
 <div align="center">
 
 <h1>
-  <span style="font-size:64px; font-weight:800; line-height:1.15; background:linear-gradient(90deg,#46cbc7,#f8fafc 50%,#de5a1d); -webkit-background-clip:text; background-clip:text; color:transparent;">
-    InstanceControl
-  </span>
+  <img src="assets/instancecontrol-title.svg" alt="InstanceControl" width="760">
 </h1>
 
 ### Controllable Complex Image Generation without Instance Labeling
