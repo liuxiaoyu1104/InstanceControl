@@ -322,7 +322,7 @@ Before evaluation, download [🤗 sam2_hiera_large.pt](https://huggingface.co/fa
 bash evalution/test.sh
 ```
 
-## Citation
+<!-- ## Citation
 
 If you find this project useful, please cite our work. Citation information will be added after the paper is available.
 
@@ -333,4 +333,4 @@ If you find this project useful, please cite our work. Citation information will
   journal = {arXiv preprint},
   year    = {2026}
 }
-```
+``` -->
