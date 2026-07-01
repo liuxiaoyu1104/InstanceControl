@@ -15,8 +15,8 @@
   <a href="https://instancecontrol.github.io/InstanceControl/">
     <img src="https://img.shields.io/badge/Homepage-Project-46cbc7" alt="Project Page">
   </a>
-  <a href="#citation">
-    <img src="https://img.shields.io/badge/arXiv-Coming%20Soon-b31b1b.svg" alt="arXiv">
+  <a href="https://arxiv.org/abs/2606.31924">
+    <img src="https://img.shields.io/badge/arXiv-2606.31924-b31b1b.svg" alt="arXiv">
   </a>
   <a href="https://huggingface.co/xiaoyu1104">
     <img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Models-yellow" alt="Hugging Face Models">
